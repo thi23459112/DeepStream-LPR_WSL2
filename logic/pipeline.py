@@ -18,7 +18,7 @@
 import sys
 from gi.repository import Gst
 from logic.config import SOURCE_CONFIGS
-
+import os
 # 是否使用 CPU 軟體編碼器（x264/x265）。若環境有 NVENC 可改 False 走硬體編碼。
 USE_CPU_ENCODER = True
 
@@ -222,12 +222,26 @@ def _build_display_sink(pipeline, num_sources, has_live_source=False):
     # 只有 Jetson 且有 nvegltransform 才使用（dGPU/WSL 不需要）
     use_egltransform = is_jetson and (Gst.ElementFactory.find("nvegltransform") is not None)
     streammux2 = make_elm("nvstreammux", "Stream-muxer-display")
-    streammux2.set_property("width", 1920)
-    streammux2.set_property("height", 1080)
-    streammux2.set_property("batch-size", num_sources)
-    streammux2.set_property("batched-push-timeout", 70000)
-    streammux2.set_property("live-source", 1 if has_live_source else 0)
-    streammux2.set_property("nvbuf-memory-type", 0)
+    streammux2.set_property("batch-size", num_sources)  # 新舊版 mux 皆支援
+
+    if os.environ.get("USE_NEW_NVSTREAMMUX") == "yes":
+        # 新版 mux：不接受 width/height/live-source 等舊屬性，改用 config_mux.txt。
+        # 來源皆 1080p、真正拼接由 tiler 完成，故新版 mux 不縮放也不影響顯示結果。
+        _mux_cfg = os.path.join(
+            os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "config_mux.txt"
+        )
+        if os.path.exists(_mux_cfg):
+            streammux2.set_property("config-file-path", _mux_cfg)
+        else:
+            print(f"[WARNING] 找不到 {_mux_cfg}，顯示用 mux 將用內建預設值")
+    else:
+        # 舊版 mux：維持原本設定
+        streammux2.set_property("width", 1920)
+        streammux2.set_property("height", 1080)
+        streammux2.set_property("batched-push-timeout", 70000)
+        # ⭐ live-source 依主線是否有 live 來源決定，不可寫死 1
+        streammux2.set_property("live-source", 1 if has_live_source else 0)
+        streammux2.set_property("nvbuf-memory-type", 0)
     tiler = make_elm("nvmultistreamtiler", "nvtiler-display")
     tiler.set_property("rows", rows)
     tiler.set_property("columns", cols)
