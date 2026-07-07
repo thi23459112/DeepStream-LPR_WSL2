@@ -175,6 +175,9 @@ def _process_tracked_frame(gst_buffer, frame_meta, current_frame_objects, pad_in
     """
     cv_regions = cfg.get("cv_regions", {})
     movement_threshold = cfg.get("track_logic", {}).get("movement_threshold", 30)
+    axis = cfg.get("track_logic", {}).get("axis", "y")   # "y"（上下）或 "x"（左右）
+    up_left_is_out = cfg.get("track_logic", {}).get("up_left_is_out", True)  # 預設：往上/往左=OUT
+    keep = cfg.get("keep_classes")                       # frozenset 或 None（None = 全收）
     save_ss = cfg.get("save_screenshot", False)
 
     l_obj = frame_meta.obj_meta_list
@@ -183,6 +186,10 @@ def _process_tracked_frame(gst_buffer, frame_meta, current_frame_objects, pad_in
         except StopIteration: break
         # 只處理車輛（PGIE）物件
         if obj_meta.unique_component_id != _UID_VEHICLE:
+            l_obj = l_obj.next
+            continue
+        # 類別過濾：不在白名單內的 class_id 直接略過（不畫框 / 不計數 / 不寫 DB）
+        if keep is not None and obj_meta.class_id not in keep:
             l_obj = l_obj.next
             continue
         obj_id = obj_meta.object_id
@@ -199,7 +206,7 @@ def _process_tracked_frame(gst_buffer, frame_meta, current_frame_objects, pad_in
         # 第一次見到這台車：建立追蹤狀態
         if unique_key not in track_history:
             track_history[unique_key] = {
-                "start_y": cy, "missing_frames": 0, "direction": "NA",
+                "start_x": cx, "start_y": cy, "missing_frames": 0, "direction": "NA",
                 "class_votes": Counter(), "plate_votes": Counter(),
                 "last_frame_num": frame_meta.frame_num, "roi_hits": {},
                 "best_class_jpg": None, "best_plate_jpg": None, "best_plate_area": 0,
@@ -226,11 +233,17 @@ def _process_tracked_frame(gst_buffer, frame_meta, current_frame_objects, pad_in
                     state["fallback_class_jpg"] = jpg
                     state["fallback_class_area"] = veh_area
 
-        # 方向判斷：以首次出現的 y 為基準，位移超過門檻即定為 IN / OUT
+        # 方向判斷：以首次出現位置為基準，所選軸位移超過門檻即定向
+        #   axis="y"：delta>0 往下、delta<0 往上；axis="x"：delta>0 往右、delta<0 往左
+        #   up_left_is_out=True（預設）：往上/往左=OUT、往下/往右=IN（與原本行為一致）
+        #   up_left_is_out=False：整個對調（鏡頭反向時用）
+        #   （DB 寫入的字串維持 "IN"/"OUT" 不變）
         if state["direction"] == "NA":
-            dy = cy - state["start_y"]
-            if dy > movement_threshold: state["direction"] = "IN"
-            elif dy < -movement_threshold: state["direction"] = "OUT"
+            delta = (cx - state["start_x"]) if axis == "x" else (cy - state["start_y"])
+            if delta > movement_threshold:
+                state["direction"] = "IN" if up_left_is_out else "OUT"
+            elif delta < -movement_threshold:
+                state["direction"] = "OUT" if up_left_is_out else "IN"
 
         # OSD：畫車框 + 標籤（ID + 車種）
         cls_id = obj_meta.class_id
@@ -366,12 +379,19 @@ def boxmot_pgie_src_probe(pad, info, u_data):
         _update_fps(pad_index)
 
         # --- 1. 蒐集 PGIE 偵測框，並把原始 obj_meta 標記移除 ---
+        keep = cfg.get("keep_classes")   # frozenset 或 None（None = 全收）
         dets_list = []
         obj_metas_to_remove = []
         l_obj = frame_meta.obj_meta_list
         while l_obj is not None:
             try: obj_meta = pyds.NvDsObjectMeta.cast(l_obj.data)
             except StopIteration: break
+            cls = int(obj_meta.class_id)
+            # 類別過濾：不在白名單內的偵測框不餵給 BoxMOT（但仍要從畫面移除，避免殘留）
+            if keep is not None and cls not in keep:
+                obj_metas_to_remove.append(obj_meta)
+                l_obj = l_obj.next
+                continue
             try:
                 # 優先用偵測器原始框（未經 tracker 平滑）
                 det_box = obj_meta.detector_bbox_info.orgbbox_coords
@@ -382,7 +402,6 @@ def boxmot_pgie_src_probe(pad, info, u_data):
                 x1, y1 = float(r.left), float(r.top)
                 x2, y2 = float(r.left + r.width), float(r.top + r.height)
             conf = float(obj_meta.confidence) if obj_meta.confidence > 0 else 0.5
-            cls = int(obj_meta.class_id)
             dets_list.append([x1, y1, x2, y2, conf, cls])
             obj_metas_to_remove.append(obj_meta)
             l_obj = l_obj.next
