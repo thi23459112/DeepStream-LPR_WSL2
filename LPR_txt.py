@@ -9,7 +9,7 @@ DeepStream 設定檔自動產生器（車牌辨識 LPR 三層版）
 2. 三層推論架構：PGIE 車輛 → SGIE 車牌 → SGIE 字元
    - PGIE   : car 模型（多車種偵測）
    - SGIE 0 : plate 模型（對車輛做車牌偵測）
-   - SGIE 1 : num 模型（對車牌做字元偵測，dynamic batch）
+   - SGIE 1 : num 模型（對車牌做字元偵測，explicit-batch 固定批次）
 3. 多 ROI 支援：每路 cam 可定義任意數量 ROI，nvdsanalytics 自動畫線
 4. YAML source 智慧解析：相對路徑、絕對路徑、RTSP、樣板都認得
 5. 追蹤器執行期設定：依 YAML tracker.type 產生 main.py 啟動時讀的旗標檔
@@ -19,7 +19,7 @@ DeepStream 設定檔自動產生器（車牌辨識 LPR 三層版）
     config_preprocess.txt              前處理（裁切 ROI、縮放、tensor 轉換）
     config_infer_primary_yolo11.txt    PGIE 車輛偵測（car_fp16.engine）
     config_infer_secondary_plate.txt   SGIE 車牌偵測（plate_fp16.engine）
-    config_infer_secondary_num.txt     SGIE 字元偵測（num_fp16.engine，dynamic batch）
+    config_infer_secondary_num.txt     SGIE 字元偵測（num_fp16.engine，explicit-batch 固定批次）
     config_nvdsanalytics.txt           ROI 區域繪製（多 ROI）
     config_tracker_runtime.txt         追蹤器執行期旗標（nvdcf / BoxMOT）
 
@@ -40,8 +40,11 @@ YAML 讀進來的關鍵欄位：
     tracker.type              nvdcf | bytetrack | ocsort | ... (全域，只讀 cfgs[0])
 
 重要對齊規則：
-    - num 模型走 dynamic batch，必須有 force-implicit-batch-dim=0
-      與 infer-dims=3;NUM_H;NUM_W，否則 DS 會把 engine 當靜態 batch 處理
+    - num 模型用 explicit-batch（full-dims）模式：force-implicit-batch-dim=0（nvinfer 預設值，
+      即不使用舊的 implicit-batch），並用 infer-dims=3;NUM_H;NUM_W 明確宣告輸入 C;H;W。
+      這兩項不會把 engine 變「動態」；engine 是靜態或動態取決於 ONNX/trtexec 怎麼 build。
+      重點是 batch-size 要對齊 num engine 實際 build 的批次，否則 DS 會蓋回 engine 真正批次，
+      導致一次只吃到少數字元裁切（早期 batch=2 漏字元的問題）。
     - output-buffer-pool-size 在多路、多 ROI 場景下必須拉大，否則會丟 buffer
     - plate 的 operate-on-class-ids 自動依 labels_car.txt 的行數產生 (0;1;...;N-1)
 """
@@ -577,7 +580,7 @@ topk=100
 
 
 # ==========================================
-# 6. 設定檔產生：num SGIE (dynamic batch)
+# 6. 設定檔產生：num SGIE (explicit-batch 固定批次)
 # ==========================================
 
 def generate_num_infer_config(cfgs: List[Dict[str, Any]]) -> None:
@@ -585,12 +588,14 @@ def generate_num_infer_config(cfgs: List[Dict[str, Any]]) -> None:
     產生 config_infer_secondary_num.txt（字元偵測，SGIE）
 
     這是跑通的核心設定，必須與 trtexec 編 engine 的設定完全對齊：
-        - infer-dims=3;num_imgsz;num_imgsz   ← 從 YAML num_imgsz 取
-        - force-implicit-batch-dim=0          ← dynamic batch 必須關掉 implicit
-        - batch-size                          ← 從 YAML num_weight_batch_size 取
+        - infer-dims=3;num_imgsz;num_imgsz   ← 從 YAML num_imgsz 取（明確宣告輸入 C;H;W）
+        - force-implicit-batch-dim=0          ← 用 explicit-batch（full-dims）模式，非動態之意
+        - batch-size                          ← 從 YAML num_weight_batch_size 取；須對齊 engine 實際批次
         - output-buffer-pool-size=32          ← 多路 × 多車 × 多字元時防止丟 buffer
 
-    任何一項漏掉都會回到 batch=2 漏字元的舊問題
+    註：force-implicit-batch-dim=0 是 nvinfer 預設值（explicit-batch），不會把靜態 engine 變動態；
+        batch-size 若和 num engine 實際 build 的批次不符，DS 會蓋回 engine 真正批次，
+        就會回到一次只吃到少數字元裁切（早期 batch=2 漏字元）的問題。
 
     參數：
         cfgs (list[dict]): 各路 cam 設定
