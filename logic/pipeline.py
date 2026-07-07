@@ -20,7 +20,6 @@
 """
 import sys
 from gi.repository import Gst
-from logic.config import SOURCE_CONFIGS
 import os
 
 
