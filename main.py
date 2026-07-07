@@ -33,10 +33,14 @@ import numpy as np
 # 必須在 import gi 之前，GStreamer 載入 nvstreammux 外掛時才讀得到。
 import os
 os.environ.setdefault("USE_NEW_NVSTREAMMUX", "no")
+# GLib/GIO 建立網路（RTSP）連線時會呼叫系統 libproxy 偵測 proxy。在 conda 環境下，
+# conda 的 libstdc++ 與系統 libunwind ABI 不相容，libproxy 拋例外時無法正常 unwind
+# 而導致行程 abort。改用 GIO 內建 dummy proxy resolver 完全繞過 libproxy。
+# 須在匯入 gi 之前設定；系統 Python 不受影響，setdefault 也不覆蓋外部既有設定。
+os.environ.setdefault("GIO_USE_PROXY_RESOLVER", "dummy")
 import gi
 gi.require_version('Gst', '1.0')
-gi.require_version('GstRtspServer', '1.0')
-from gi.repository import GLib, Gst, GstRtspServer
+from gi.repository import GLib, Gst
 
 import pyds
 
@@ -49,7 +53,7 @@ from logic.config import (
 )
 from logic.state_db import initialize_state_managers, force_finalize_all
 from logic.pipeline import (
-    cb_source_setup, make_elm,
+    cb_source_setup, make_elm, resolve_tracker_lib,
     _build_display_sink, setup_cam_branch,
 )
 from logic.probes import (
@@ -67,7 +71,6 @@ from logic.probes import (
 g_loop          = None
 g_pipeline      = None
 g_eos_triggered = False
-g_rtsp_server   = None
 g_obj_enc_ctx   = None
 
 
@@ -218,36 +221,6 @@ def _enlarge_queue(q, max_buffers=400):
     q.set_property("max-size-time", 0)
 
 
-def _start_rtsp_server(rtsp_routes):
-    """
-    依各路的 RTSP 推流設定，建立 GstRtspServer 並掛載各 mount point。
-    同一個 port 下可掛多條路徑（依 udp_port 區分來源）。
-    """
-    if not rtsp_routes: return None
-    routes_by_port = {}
-    for r in rtsp_routes: routes_by_port.setdefault(r["port"], []).append(r)
-    servers = []
-    for port, routes in routes_by_port.items():
-        server = GstRtspServer.RTSPServer()
-        server.set_service(str(port))
-        mounts = server.get_mount_points()
-        for r in routes:
-            udp_port, encoder = r["udp_port"], r["encoder"]
-            mount_path = "/" + r["mount_path"].lstrip("/")
-            enc_name = "H265" if encoder == "h265" else "H264"
-            # 從 udpsink 推出的 RTP 由 udpsrc 接回，再 depay/pay 給 RTSP client
-            launch_str = (f"( udpsrc port={udp_port} caps=\"application/x-rtp, media=video, clock-rate=90000, encoding-name={enc_name}, payload=96\" "
-                          f"! rtp{encoder}depay ! rtp{encoder}pay name=pay0 pt=96 )")
-            factory = GstRtspServer.RTSPMediaFactory()
-            factory.set_launch(launch_str)
-            factory.set_shared(True)
-            mounts.add_factory(mount_path, factory)
-            print(f"[INFO] RTSP 推流註冊: rtsp://<本機IP>:{port}{mount_path}")
-        server.attach(None)
-        servers.append(server)
-    return servers
-
-
 def _init_obj_encoder_if_needed():
     """
     截圖走 CPU（系統記憶體 RGBA + cv2）路徑，不需要 GPU Object Encoder context。
@@ -261,7 +234,7 @@ def _init_obj_encoder_if_needed():
 
 
 def main():
-    global g_loop, g_pipeline, g_eos_triggered, g_rtsp_server, g_obj_enc_ctx
+    global g_loop, g_pipeline, g_eos_triggered, g_obj_enc_ctx
 
     # ---- 追蹤器初始化（BoxMOT 模式需先為各路建立 tracker）----
     if TRACKER_MODE == "nvdcf":
@@ -339,7 +312,7 @@ def main():
     if TRACKER_MODE == "nvdcf":
         tracker = make_elm("nvtracker", "tracker")
         tracker.set_property("ll-config-file", TRACKER_CONFIG)
-        tracker.set_property("ll-lib-file", "/opt/nvidia/deepstream/deepstream/lib/libnvds_nvmultiobjecttracker.so")
+        tracker.set_property("ll-lib-file", resolve_tracker_lib())
         tracker.set_property("tracker-width", 640)
         tracker.set_property("tracker-height", 384)
 
@@ -366,15 +339,8 @@ def main():
     q4.link(demux)
 
     display_streammux = _build_display_sink(g_pipeline, num_sources) if show_window else None
-    rtsp_routes = []
     for pad_index, cfg in SOURCE_CONFIGS.items():
-        udp_port = setup_cam_branch(g_pipeline, pad_index, cfg, demux, display_streammux, per_cam_osd_probe)
-        if udp_port is not None:
-            rtsp_routes.append({"pad_index": pad_index, "udp_port": udp_port, "port": cfg["rtsp_push"]["port"], "mount_path": cfg["rtsp_push"]["mount_path"], "encoder": cfg["rtsp_push"]["encoder"]})
-
-    if rtsp_routes:
-        g_rtsp_server = _start_rtsp_server(rtsp_routes)
-        print(f"[INFO] 共 {len(rtsp_routes)} 條 RTSP 推流就緒")
+        setup_cam_branch(g_pipeline, pad_index, cfg, demux, display_streammux, per_cam_osd_probe)
 
     # ---- 訊號處理 +（有終端機才）鍵盤監聽 + 主迴圈 ----
     g_loop = GLib.MainLoop()
