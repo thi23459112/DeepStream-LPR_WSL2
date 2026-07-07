@@ -85,13 +85,21 @@ def resolve_tracker_lib():
     return "/opt/nvidia/deepstream/deepstream/lib/libnvds_nvmultiobjecttracker.so"
 
 
-def cb_source_setup(decodebin, source_element, user_data):
-    """uridecodebin 內部建立 rtspsrc 時的調校（強制 TCP、設延遲與逾時、超延遲丟幀）。"""
-    if source_element.get_name().startswith("rtspsrc"):
-        source_element.set_property("protocols", 4)          # 4 = TCP
-        source_element.set_property("latency", 200)
-        source_element.set_property("timeout", 5000000)
-        source_element.set_property("drop-on-latency", True)
+def cb_decodebin_child_added(child_proxy, obj, name, user_data):
+    """
+    nvurisrcbin 內部子元件建立時的回呼（取代 uridecodebin 的 source-setup 訊號，
+    nvurisrcbin 沒有 source-setup，須用 child-added 遞迴往內抓）。
+      - 內層還有 decodebin 時繼續往下掛，才追得到最底層的 rtspsrc。
+      - 對 rtspsrc 強制 TCP、設抖動緩衝與連線逾時、超延遲丟幀。
+    只在元件確實有該屬性時才設定（_safe_set），檔案來源的內部元件不受影響。
+    """
+    if name.find("decodebin") != -1:
+        obj.connect("child-added", cb_decodebin_child_added, user_data)
+    if name.find("source") != -1:
+        _safe_set(obj, "protocols", 4)          # 4 = TCP
+        _safe_set(obj, "latency", 200)          # 抖動緩衝 200ms
+        _safe_set(obj, "timeout", 5000000)      # 連線逾時 5 秒（微秒）
+        _safe_set(obj, "drop-on-latency", True)
 
 
 def make_elm(gst_type, name):
