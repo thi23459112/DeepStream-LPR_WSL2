@@ -989,7 +989,6 @@ def main() -> None:
     print(f"Streammux 輸出尺寸: {muxer_w} x {muxer_h}")
 
     car_batch   = get_engine_batch(cfgs, "car")
-    plate_batch = get_engine_batch(cfgs, "plate")
     num_batch   = get_engine_batch(cfgs, "num")
     car_imgsz   = get_engine_imgsz(cfgs, "car")
     num_imgsz   = get_engine_imgsz(cfgs, "num")
@@ -1007,7 +1006,7 @@ def main() -> None:
         if regions:
             print(f"           ROI 數量: {len(regions)} → {list(regions.keys())}")
         else:
-            print(f"           未定義 ROI，將使用全畫面")
+            print("           未定義 ROI，將使用全畫面")
 
     # 步驟 3: 依序產生 7 個設定檔
     generate_preprocess_config(cfgs)
@@ -1032,7 +1031,7 @@ def main() -> None:
     # BoxMOT 模式額外提示
     if tracker_mode != "nvdcf":
         print(f"\n  ⚠ tracker.type = '{tracker_mode}' (BoxMOT)")
-        print(f"     main.py 啟動後將 *跳過* nvtracker，改在 pgie.src 探針裡用 BoxMOT 接管")
+        print("     main.py 啟動後將 *跳過* nvtracker，改在 pgie.src 探針裡用 BoxMOT 接管")
         print(f"     BoxMOT 微調請直接編輯：boxmot/configs/trackers/{tracker_mode}.yaml")
 
 
