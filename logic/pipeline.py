@@ -12,8 +12,8 @@
   - setup_cam_branch：demux 之後，為「每一路」組裝 OSD 與顯示/存檔下游。
 
 平台差異重點：
-  USE_CPU_ENCODER 預設「自動偵測」：偵測得到 NVENC 走硬體編碼，否則退回 x264/x265 CPU 編碼；
-  可用環境變數 USE_CPU_ENCODER 強制覆寫。nvosd 的 process-mode 與顯示 sink 也依平台自動選擇。
+  USE_CPU_ENCODER 預設「優先 NVENC」：預設走硬體編碼，只有確實建不出 NVENC 才退回 x264/x265 CPU 編碼；
+  可用環境變數 USE_CPU_ENCODER 強制覆寫（1=CPU、0=NVENC）。nvosd 的 process-mode 與顯示 sink 也依平台自動選擇。
   顯示 sink 找不到 NVIDIA sink（nveglglessink/nv3dsink）時，會退回標準 GStreamer sink
   （ximagesink/glimagesink/autovideosink，可用 DS_DISPLAY_SINK 指定）。
 ================================================================================
@@ -26,26 +26,37 @@ import os
 
 def _detect_cpu_encoder():
     """
-    自動決定是否使用 CPU 軟體編碼器（x264/x265）。
+    決定是否使用 CPU 軟體編碼器（x264/x265）。
 
     規則（可用環境變數 USE_CPU_ENCODER 覆寫，1/true=強制 CPU，0/false=強制 NVENC）：
       - 環境變數有明確指定 → 依指定
-      - 否則：偵測得到 NVENC（nvv4l2h264enc）→ 走硬體編碼（False）
-              偵測不到（常見於部分 WSL / 無 NVENC 環境）→ 退回 CPU 編碼（True）
+      - 否則：預設優先使用 NVENC 硬體編碼（較快）；只有在「確實建不出 NVENC」時才退回 CPU，
+              避免在無 NVENC 的環境（如部分 WSL）直接中斷。
     """
     env = os.environ.get("USE_CPU_ENCODER")
     if env is not None:
         return env.strip().lower() in ("1", "true", "yes", "on")
-    has_nvenc = Gst.ElementFactory.find("nvv4l2h264enc") is not None
-    if has_nvenc:
-        print("[INFO] 偵測到 NVENC（nvv4l2h264enc），使用硬體編碼")
+    # 預設 = NVENC。用「實際建立元件」測試（比 ElementFactory.find 更可靠）
+    test = Gst.ElementFactory.make("nvv4l2h264enc", None)
+    if test is not None:
+        print("[INFO] 預設使用 NVENC 硬體編碼（nvv4l2h264enc）")
         return False
-    print("[INFO] 未偵測到 NVENC，退回 CPU 軟體編碼（x264/x265）")
+    print("[INFO] 建不出 NVENC，退回 CPU 軟體編碼（x264/x265）")
     return True
 
 
-# 是否使用 CPU 軟體編碼器。預設自動偵測；可用環境變數 USE_CPU_ENCODER 強制覆寫。
-USE_CPU_ENCODER = _detect_cpu_encoder()
+# 編碼器選擇「延遲判斷」：不在 import 當下決定，而是等第一次真正要建編碼器時才判斷並快取。
+# 原因：main.py 是先 import 本模組、之後才在 main() 裡呼叫 Gst.init(None)。若在 import 當下就判斷，
+# 會早於 Gst.init()，此時 GStreamer 尚未初始化、抓不到 NVENC，導致「不設環境變數就誤退 CPU」。
+_USE_CPU_ENCODER = None   # None=尚未判斷；True/False=已快取
+
+
+def use_cpu_encoder():
+    """回傳是否使用 CPU 編碼；第一次呼叫時才判斷並快取（此時 Gst.init() 已完成，能正確抓到 NVENC）。"""
+    global _USE_CPU_ENCODER
+    if _USE_CPU_ENCODER is None:
+        _USE_CPU_ENCODER = _detect_cpu_encoder()
+    return _USE_CPU_ENCODER
 
 
 def resolve_tracker_lib():
@@ -123,7 +134,7 @@ def _configure_encoder(encoder, bitrate, iframeinterval):
 
 def _enc_caps_string(framerate=None):
     """依編碼器型別回傳編碼前所需的 caps 字串（CPU 走 I420 系統記憶體；NVENC 走 NV12 NVMM）。"""
-    base = "video/x-raw, format=I420" if USE_CPU_ENCODER else "video/x-raw(memory:NVMM), format=NV12"
+    base = "video/x-raw, format=I420" if use_cpu_encoder() else "video/x-raw(memory:NVMM), format=NV12"
     if framerate is not None: base += f", framerate={framerate}/1"
     return base
 
@@ -135,7 +146,7 @@ def _make_encoder(name_prefix, i, codec, bitrate_bps, iframeinterval):
       GPU：nvv4l2h264enc / nvv4l2h265enc。
     """
     is_h265 = (codec == "h265")
-    if USE_CPU_ENCODER:
+    if use_cpu_encoder():
         enc_type = "x265enc" if is_h265 else "x264enc"
         encoder = make_elm(enc_type, f"{name_prefix}-{i}")
         _safe_set(encoder, "bitrate", max(1, int(bitrate_bps / 1000)))  # bps → kbps
