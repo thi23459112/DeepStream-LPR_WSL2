@@ -57,10 +57,37 @@ _URI_SCHEMES = ("file://", "rtsp://", "rtsps://", "http://", "https://")
 # 撞號的紀錄靠 CreateTime 區分；查 DB 時記得帶時間範圍
 LOCAL_ID_MAX = 999999
 
+# --- streammux 輸出尺寸（固定 1920×1080，跨解析度來源座標對齊用）---
+# 所有來源進 pipeline 後都由 streammux 縮放到這個尺寸；ROI/crop 的座標系一律以此為準。
+# 使用者在 YAML 依「來源真實解析度」標點位，載入時自動依 base_w/base_h 比例換算到此尺寸，
+# 如此即使同時跑不同解析度來源（1080p + 720p + 4K），所有 ROI 也都對得齊。
+MUX_OUTPUT_W = 1920
+MUX_OUTPUT_H = 1080
+
 
 # ==========================================
 # 2. YAML source 智慧解析 (Source URI Resolver)
 # ==========================================
+
+def _scale_points(points, base_w, base_h):
+    """
+    把「來源真實解析度(base_w×base_h)」座標系的點位換算成 streammux 輸出(1920×1080)座標系。
+
+    參數：
+        points (list): [[x,y], ...] 來源座標系點位
+        base_w/base_h (int): 該來源的真實解析度（YAML geometry.base_w/base_h）
+    返回：
+        list: [[x,y], ...] 換算成 1920×1080 座標系後的整數點位（比例 1:1 時原樣回傳）
+    """
+    if not points:
+        return points
+    if not base_w or not base_h:
+        return points
+    sx = MUX_OUTPUT_W / float(base_w)
+    sy = MUX_OUTPUT_H / float(base_h)
+    if sx == 1.0 and sy == 1.0:
+        return points
+    return [[int(round(p[0] * sx)), int(round(p[1] * sy))] for p in points]
 
 def _resolve_source_uri(raw):
     """
@@ -178,7 +205,7 @@ def load_dynamic_configs(yaml_dir):
        - source / stream_fps      : 解析後的 URI 與真實 FPS
        - is_file_source           : 來源是否為本地檔案
        - start_time_dt            : 影片首幀對應的真實時刻
-       - rtsp_push                : RTSP 推流標準化設定 dict
+       - keep_classes             : 類別過濾白名單（frozenset 或 None）
 
     參數：
         yaml_dir (str): YAML 資料夾路徑
@@ -202,10 +229,36 @@ def load_dynamic_configs(yaml_dir):
         device_cfg = data.get("device", {}) or {}
         data["device_code"] = str(device_cfg.get("code", "UNKNOWN"))
 
-        # 步驟 2: 多 ROI 轉 numpy（給 probe 的 pointPolygonTest 用）
-        regions_raw = data.get("geometry", {}).get("regions", {}) or {}
+        # 步驟 2: ROI / crop 依 base_w/base_h 自動換算成 1920×1080 座標系
+        # 使用者在 YAML 按「來源真實解析度」標點位，這裡依比例縮放，與 streammux 縮放後的
+        # 物件座標對齊（1080P 來源比例 1:1，數字不變；720P/4K 來源自動對齊）。
+        geo = data.get("geometry", {}) or {}
+        base_w = int(geo.get("base_w", MUX_OUTPUT_W))
+        base_h = int(geo.get("base_h", MUX_OUTPUT_H))
+
+        regions_src = geo.get("regions", {}) or {}
+        regions_scaled = {}
+        for roi_name, pts in regions_src.items():
+            regions_scaled[roi_name] = _scale_points(pts, base_w, base_h) if pts else pts
+
+        crop_src = geo.get("crop_points")
+        crop_scaled = _scale_points(crop_src, base_w, base_h) if crop_src else crop_src
+
+        if (base_w, base_h) != (MUX_OUTPUT_W, MUX_OUTPUT_H):
+            print(f"[INFO] {cam_name} 來源座標 {base_w}x{base_h} → 自動換算成 "
+                  f"{MUX_OUTPUT_W}x{MUX_OUTPUT_H}（ROI/crop 依比例縮放）")
+
+        # 回寫縮放後的 geometry，並把 base_w/base_h 標準化為輸出尺寸
+        geo["regions"] = regions_scaled
+        if crop_src:
+            geo["crop_points"] = crop_scaled
+        geo["base_w"] = MUX_OUTPUT_W
+        geo["base_h"] = MUX_OUTPUT_H
+        data["geometry"] = geo
+
+        # 多 ROI 轉 numpy（此時 regions 已是 1080P 座標，給 probe 的 pointPolygonTest 用）
         cv_regions = {}
-        for roi_name, pts in regions_raw.items():
+        for roi_name, pts in regions_scaled.items():
             if pts and len(pts) >= 3:
                 cv_regions[str(roi_name)] = np.array(pts, np.int32)
             else:
@@ -215,13 +268,34 @@ def load_dynamic_configs(yaml_dir):
             print(f"[WARNING] {cam_name} 沒有任何有效的 ROI，將不會產生任何 DB 紀錄")
 
         # 步驟 3: track_logic 標準化（給 probes.py 用）
-        # movement_threshold = Y 軸位移像素門檻（小於此值方向判定為 NA，不寫 DB）
+        # axis               = 依哪個座標軸判斷進出方向
+        #                        "y"（預設）→ 看垂直位移：向下 / 向上
+        #                        "x"        → 看水平位移：向右 / 向左
+        # up_left_is_out     = 方向對應是否「往上/往左 = OUT」（預設 True）
+        #                        True ：往上/往左=OUT、往下/往右=IN（與原本行為一致）
+        #                        False：反轉，往上/往左=IN、往下/往右=OUT（鏡頭反向時用）
+        # movement_threshold = 所選軸的位移像素門檻（絕對值小於此值視為抖動 → NA，不寫 DB）
         # min_roi_hits       = ROI 命中最少幀數（小於此值視為短暫飄過，不寫 DB）
         tl_cfg = data.get("track_logic", {}) or {}
+        axis = str(tl_cfg.get("axis", "y")).lower().strip()
+        if axis not in ("x", "y"):
+            print(f"[WARNING] {cam_name} track_logic.axis 值非法（'{axis}'），退回 'y'")
+            axis = "y"
         data["track_logic"] = {
+            "axis":               axis,
             "movement_threshold": int(tl_cfg.get("movement_threshold", 30)),
             "min_roi_hits":       int(tl_cfg.get("min_roi_hits", 2)),
+            "up_left_is_out":     bool(tl_cfg.get("up_left_is_out", True)),
         }
+
+        # keep_classes：這一路只保留哪些「模型原始 class_id」（類別過濾白名單）
+        #   有寫非空清單 → 標準化成 frozenset，probe 只處理清單內的 class_id，其餘偵測框丟掉
+        #   沒寫 / 空清單   → None，代表全收（不過濾，維持原本行為）
+        keep_raw = data.get("keep_classes")
+        if keep_raw:
+            data["keep_classes"] = frozenset(int(c) for c in keep_raw)
+        else:
+            data["keep_classes"] = None
 
         # 步驟 4: 輸出設定 - DB
         # 新欄位 output_db_dir / save_output_db；舊欄位 output_excel_dir 仍向下相容
@@ -310,16 +384,6 @@ def load_dynamic_configs(yaml_dir):
             os.makedirs(data["screenshot_dir_class"], exist_ok=True)
             os.makedirs(data["screenshot_dir_lpr"], exist_ok=True)
             print(f"[INFO] {cam_name} 截圖已啟用，根目錄：{ss_base}")
-
-        # 步驟 9: RTSP 推流設定標準化
-        rtsp_cfg = data.get("rtsp_push", {}) or {}
-        data["rtsp_push"] = {
-            "enable":     bool(rtsp_cfg.get("enable", False)),
-            "port":       int(rtsp_cfg.get("port", 8554)),
-            "mount_path": str(rtsp_cfg.get("mount_path", cam_name)),
-            "bitrate":    int(rtsp_cfg.get("bitrate", 4000000)),
-            "encoder":    str(rtsp_cfg.get("encoder", "h264")).lower(),
-        }
 
         configs[pad_index] = data
 
