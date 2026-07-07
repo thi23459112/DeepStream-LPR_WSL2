@@ -23,8 +23,6 @@
 ================================================================================
 """
 import sys
-import time
-import select
 import termios
 import tty
 import signal
@@ -44,12 +42,11 @@ from gi.repository import GLib, Gst
 
 import pyds
 
-from logic.color import load_labels, CLASS_MAP
 from logic.config import (
     SOURCE_CONFIGS, INFER_CONFIG, TRACKER_CONFIG,
     PREPROCESS_CONFIG, ANALYTICS_CONFIG,
     INFER_SEC_PLATE_CONFIG, INFER_SEC_NUM_CONFIG,
-    TRACKER_MODE, BOXMOT_TRACKER_CONFIG,
+    TRACKER_MODE,
 )
 from logic.state_db import initialize_state_managers, force_finalize_all
 from logic.pipeline import (
@@ -63,7 +60,6 @@ from logic.probes import (
     assemble_plate_probe,
     per_cam_osd_probe,
     set_obj_enc_context,
-    g_frame_buffer,         # ⭐ 全域幀緩存（依 PTS 對齊）
     store_frame_for_pad,    # ⭐ appsink 用：把幀連同 PTS 存入緩存
 )
 
