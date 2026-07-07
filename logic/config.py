@@ -133,7 +133,7 @@ def _resolve_source_uri(raw):
     if not os.path.exists(s):
         print(f"[WARNING] source 對應的檔案不存在：{s}")
         print(f"[WARNING]   原始 YAML 寫法：'{raw}'")
-        print(f"[WARNING]   pipeline 啟動時很可能失敗，請確認路徑與檔名")
+        print("[WARNING]   pipeline 啟動時很可能失敗，請確認路徑與檔名")
 
     return f"file://{s}"
 
@@ -205,7 +205,6 @@ def load_dynamic_configs(yaml_dir):
        - source / stream_fps      : 解析後的 URI 與真實 FPS
        - is_file_source           : 來源是否為本地檔案
        - start_time_dt            : 影片首幀對應的真實時刻
-       - keep_classes             : 類別過濾白名單（frozenset 或 None）
 
     參數：
         yaml_dir (str): YAML 資料夾路徑
@@ -287,15 +286,6 @@ def load_dynamic_configs(yaml_dir):
             "min_roi_hits":       int(tl_cfg.get("min_roi_hits", 2)),
             "up_left_is_out":     bool(tl_cfg.get("up_left_is_out", True)),
         }
-
-        # keep_classes：這一路只保留哪些「模型原始 class_id」（類別過濾白名單）
-        #   有寫非空清單 → 標準化成 frozenset，probe 只處理清單內的 class_id，其餘偵測框丟掉
-        #   沒寫 / 空清單   → None，代表全收（不過濾，維持原本行為）
-        keep_raw = data.get("keep_classes")
-        if keep_raw:
-            data["keep_classes"] = frozenset(int(c) for c in keep_raw)
-        else:
-            data["keep_classes"] = None
 
         # 步驟 4: 輸出設定 - DB
         # 新欄位 output_db_dir / save_output_db；舊欄位 output_excel_dir 仍向下相容
