@@ -22,7 +22,6 @@
   差一格，也只會「少存幾格」而不會「對到錯誤的畫面」——這對車牌小框的裁切尤其重要。
 ================================================================================
 """
-import os
 import time
 import threading
 import cv2
@@ -35,7 +34,7 @@ from logic.color import get_class_color, CLASS_MAP, NUM_MAP
 from logic.config import SOURCE_CONFIGS
 from logic.state_db import (
     get_local_id, _finalize_one, flush_pending_to_db,
-    track_history, pending_records, last_flush_times, fps_streams, local_id_maps
+    track_history, last_flush_times, fps_streams, local_id_maps
 )
 
 # ---- 全域狀態 ----
@@ -177,7 +176,6 @@ def _process_tracked_frame(gst_buffer, frame_meta, current_frame_objects, pad_in
     movement_threshold = cfg.get("track_logic", {}).get("movement_threshold", 30)
     axis = cfg.get("track_logic", {}).get("axis", "y")   # "y"（上下）或 "x"（左右）
     up_left_is_out = cfg.get("track_logic", {}).get("up_left_is_out", True)  # 預設：往上/往左=OUT
-    keep = cfg.get("keep_classes")                       # frozenset 或 None（None = 全收）
     save_ss = cfg.get("save_screenshot", False)
 
     l_obj = frame_meta.obj_meta_list
@@ -186,10 +184,6 @@ def _process_tracked_frame(gst_buffer, frame_meta, current_frame_objects, pad_in
         except StopIteration: break
         # 只處理車輛（PGIE）物件
         if obj_meta.unique_component_id != _UID_VEHICLE:
-            l_obj = l_obj.next
-            continue
-        # 類別過濾：不在白名單內的 class_id 直接略過（不畫框 / 不計數 / 不寫 DB）
-        if keep is not None and obj_meta.class_id not in keep:
             l_obj = l_obj.next
             continue
         obj_id = obj_meta.object_id
@@ -379,7 +373,6 @@ def boxmot_pgie_src_probe(pad, info, u_data):
         _update_fps(pad_index)
 
         # --- 1. 蒐集 PGIE 偵測框，並把原始 obj_meta 標記移除 ---
-        keep = cfg.get("keep_classes")   # frozenset 或 None（None = 全收）
         dets_list = []
         obj_metas_to_remove = []
         l_obj = frame_meta.obj_meta_list
@@ -387,11 +380,6 @@ def boxmot_pgie_src_probe(pad, info, u_data):
             try: obj_meta = pyds.NvDsObjectMeta.cast(l_obj.data)
             except StopIteration: break
             cls = int(obj_meta.class_id)
-            # 類別過濾：不在白名單內的偵測框不餵給 BoxMOT（但仍要從畫面移除，避免殘留）
-            if keep is not None and cls not in keep:
-                obj_metas_to_remove.append(obj_meta)
-                l_obj = l_obj.next
-                continue
             try:
                 # 優先用偵測器原始框（未經 tracker 平滑）
                 det_box = obj_meta.detector_bbox_info.orgbbox_coords
