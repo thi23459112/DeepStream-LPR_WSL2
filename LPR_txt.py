@@ -105,6 +105,87 @@ SUPPORTED_BOXMOT_TRACKERS = [
 # --- 支援的 URI scheme（與 logic/config.py 一致） ---
 _URI_SCHEMES = ("file://", "rtsp://", "rtsps://", "http://", "https://")
 
+# --- streammux 輸出尺寸（固定 1920×1080，跨解析度來源座標對齊用）---
+# 與 logic/config.py 的 MUX_OUTPUT_W/H 一致：所有 ROI/crop 依 base_w/base_h 換算到此尺寸。
+MUX_OUTPUT_W = 1920
+MUX_OUTPUT_H = 1080
+
+
+def _ds_lib_root() -> str:
+    """
+    自動偵測 DeepStream 的 lib 根目錄（跨平台 / 跨版本）。
+
+    順序：環境變數 DS_LIB_ROOT → /opt/nvidia/deepstream/deepstream/lib →
+          /opt/nvidia/deepstream/deepstream*/lib（glob 取最後一個）→ 標準路徑保底。
+    """
+    env = os.environ.get("DS_LIB_ROOT", "").strip()
+    if env and os.path.isdir(env):
+        return env
+    std = "/opt/nvidia/deepstream/deepstream/lib"
+    if os.path.isdir(std):
+        return std
+    hits = sorted(glob.glob("/opt/nvidia/deepstream/deepstream*/lib"))
+    if hits:
+        return hits[-1]
+    return std
+
+
+def resolve_tracker_lib() -> str:
+    """自動解析 nvtracker 的 ll-lib-file 路徑（找不到時以標準 nvidia 路徑保底）。"""
+    env = os.environ.get("DS_TRACKER_LIB", "").strip()
+    if env and os.path.exists(env):
+        return env
+    p = os.path.join(_ds_lib_root(), "libnvds_nvmultiobjecttracker.so")
+    return p
+
+
+def resolve_preprocess_lib() -> str:
+    """自動解析 nvdspreprocess 的 custom-lib-path（找不到時以標準 nvidia 路徑保底）。"""
+    p = os.path.join(_ds_lib_root(), "gst-plugins", "libcustom2d_preprocess.so")
+    return p
+
+
+def _scale_points(points, base_w, base_h):
+    """把來源真實解析度座標的點位換算成 1920×1080 座標（比例 1:1 時原樣回傳）。"""
+    if not points:
+        return points
+    if not base_w or not base_h:
+        return points
+    sx = MUX_OUTPUT_W / float(base_w)
+    sy = MUX_OUTPUT_H / float(base_h)
+    if sx == 1.0 and sy == 1.0:
+        return points
+    return [[int(round(p[0] * sx)), int(round(p[1] * sy))] for p in points]
+
+
+def scale_geometry_to_output(cfgs: List[Dict[str, Any]]) -> None:
+    """
+    就地把每路 cam 的 geometry（regions / crop_points）依 base_w/base_h 換算成 1920×1080 座標，
+    並把 base_w/base_h 標準化為輸出尺寸。與 logic/config.py 的行為完全一致，
+    確保產生器與執行期用同一套座標系（混合解析度來源也能對齊）。
+    """
+    for cfg in cfgs:
+        geo = cfg.get("geometry", {}) or {}
+        base_w = int(geo.get("base_w", MUX_OUTPUT_W))
+        base_h = int(geo.get("base_h", MUX_OUTPUT_H))
+
+        regions_src = geo.get("regions", {}) or {}
+        geo["regions"] = {
+            name: (_scale_points(pts, base_w, base_h) if pts else pts)
+            for name, pts in regions_src.items()
+        }
+        crop_src = geo.get("crop_points")
+        if crop_src:
+            geo["crop_points"] = _scale_points(crop_src, base_w, base_h)
+
+        if (base_w, base_h) != (MUX_OUTPUT_W, MUX_OUTPUT_H):
+            print(f"[INFO] {cfg.get('source_id','cam')} 來源座標 {base_w}x{base_h} → "
+                  f"換算成 {MUX_OUTPUT_W}x{MUX_OUTPUT_H}（ROI/crop 依比例縮放）")
+
+        geo["base_w"] = MUX_OUTPUT_W
+        geo["base_h"] = MUX_OUTPUT_H
+        cfg["geometry"] = geo
+
 
 # ==========================================
 # 2. 通用輔助函式 (Utility Functions)
@@ -243,19 +324,17 @@ def crop_points_to_rect(points: List[List[int]]) -> Tuple[int, int, int, int]:
 
 def resolve_muxer_size(cfgs: List[Dict[str, Any]]) -> Tuple[int, int]:
     """
-    所有 cam 的 base_w / base_h 取最大值供 streammux 使用
+    streammux 輸出尺寸固定為 1920×1080。
 
-    streammux 會把所有 stream 都縮放到這個尺寸
+    所有來源都由 streammux 縮放到此尺寸，且 ROI/crop 已於 scale_geometry_to_output()
+    換算到同一座標系，因此即使混合不同解析度來源，座標也都對齊。
 
     參數：
-        cfgs (list[dict]): 各路 cam 設定
-
+        cfgs (list[dict]): 各路 cam 設定（此處僅為介面相容，不影響回傳值）
     返回：
-        tuple: (muxer_width, muxer_height)
+        tuple: (1920, 1080)
     """
-    max_w = max(cfg["geometry"]["base_w"] for cfg in cfgs)
-    max_h = max(cfg["geometry"]["base_h"] for cfg in cfgs)
-    return max_w, max_h
+    return MUX_OUTPUT_W, MUX_OUTPUT_H
 
 
 def compute_tiled_layout(num_sources: int) -> Tuple[int, int]:
@@ -369,7 +448,7 @@ def generate_preprocess_config(cfgs: List[Dict[str, Any]]) -> None:
         "scaling-filter=0",
         "maintain-aspect-ratio=1",
         "symmetric-padding=1",
-        "custom-lib-path=/opt/nvidia/deepstream/deepstream/lib/gst-plugins/libcustom2d_preprocess.so",
+        f"custom-lib-path={resolve_preprocess_lib()}",
         "custom-tensor-preparation-function=CustomTensorPreparation",
         "",
         "[user-configs]",
@@ -843,7 +922,7 @@ def generate_deepstream_app_config(cfgs: List[Dict[str, Any]], muxer_w: int, mux
         "enable=1",
         "tracker-width=640",
         "tracker-height=384",
-        "ll-lib-file=/opt/nvidia/deepstream/deepstream/lib/libnvds_nvmultiobjecttracker.so",
+        f"ll-lib-file={resolve_tracker_lib()}",
         f"ll-config-file={BASE_DIR}/config_tracker_NvDCF_accuracy.yml",
         "gpu-id=0",
         "display-tracking-id=1",
@@ -896,6 +975,9 @@ def main() -> None:
     print("正在載入 YAML 設定檔...")
     cfgs = load_all_yamls(YAML_DIR)
     print(f"已載入 {len(cfgs)} 個攝影機設定")
+
+    # 步驟 0: ROI/crop 依 base_w/base_h 換算成 1920×1080 座標系（與執行期 config.py 一致）
+    scale_geometry_to_output(cfgs)
 
     # 步驟 1: 算 streammux 尺寸與三個 engine 參數
     muxer_w, muxer_h = resolve_muxer_size(cfgs)
