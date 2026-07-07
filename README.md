@@ -9,7 +9,7 @@
 - **三層 GIE 串接**：`PGIE 車輛偵測 → [tracker] → SGIE 車牌框偵測 → SGIE 車牌字元辨識 → nvdsanalytics`。三個 engine 的 `gie-unique-id` 分別為 1（車輛）、2（車牌）、3（字元）。
 - **單一 pipeline、多路來源**：所有 cam 共用一條 pipeline，`streammux` 的 batch 自動等於 cam 數；demux 後再逐路做 OSD 與顯示 / 寫檔。
 - **preprocess 裁切 ROI**：`nvdspreprocess` 依各路 `crop_points` 只把矩形內畫面送進 PGIE，節省算力（張量規格由 `weight_imgsz` / `weight_batch_size` 帶入）。
-- **num 動態 batch**：字元模型走 dynamic batch，自動帶 `force-implicit-batch-dim=0` 與 `infer-dims`，避免被當靜態 batch 處理。
+- **num explicit-batch（固定批次）**：字元模型用 explicit-batch（full-dims）模式，帶 `force-implicit-batch-dim=0`（nvinfer 預設，非「動態」之意）與 `infer-dims=3;H;W` 明確宣告輸入維度。engine 是靜態或動態取決於 ONNX / trtexec 如何 build；重點是設定的 `batch-size` 要對齊 num engine 實際 build 的批次，否則會被 DeepStream 蓋回 engine 真正批次。
 - **設定檔自動產生**：`LPR_txt.py` 讀 YAML 產生 8 份 DeepStream 設定檔（app / preprocess / 三層 infer / analytics / tracker runtime / mux）。
 
 ## 二、車牌組字與截圖
