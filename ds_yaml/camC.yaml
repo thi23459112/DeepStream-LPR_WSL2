@@ -73,14 +73,20 @@ session:
 # ------------------------------------------------------------
 # 容忍 / 抖動過濾 ⭐
 # ------------------------------------------------------------
-# movement_threshold = Y 軸位移像素門檻
-#   位移 > 此值 → IN（向下移動）
-#   位移 < -此值 → OUT（向上移動）
+# axis = 依哪一個座標軸判斷進出方向
+#   "y"（預設）→ 看垂直位移：向下為 IN、向上為 OUT
+#   "x"        → 看水平位移：向右為 IN、向左為 OUT
+# movement_threshold = 所選軸的位移像素門檻
+#   位移 > 此值 → IN（y:向下 / x:向右）
+#   位移 < -此值 → OUT（y:向上 / x:向左）
 #   絕對值 < 此值 → NA（視為抖動誤判，不寫 DB）
 # min_roi_hits = ROI 命中最少幀數（防止短暫飄過誤判）
 track_logic:
+  axis: "y"                           # ⭐ 改這裡切換判斷軸：'y'（上下）或 'x'（左右）
   movement_threshold: 30
   min_roi_hits: 2
+  up_left_is_out: true                # true ：往上/往左=OUT、往下/往右=IN
+                                      # false：反轉，往上/往左=IN、往下/往右=OUT
 
 # ------------------------------------------------------------
 # 輸出設定 ⭐
@@ -102,18 +108,6 @@ display:
   show_fps_overlay: true              # 可選：true / false  畫面左上 FPS
   show_roi: true                      # 可選：true / false  ROI 黃線
   show_crop: true                     # 可選：true / false  裁切框青綠線
-
-# ------------------------------------------------------------
-# RTSP 推流 ⭐
-# ------------------------------------------------------------
-# 連線範例：rtsp://<邊緣機 IP>:<port>/<mount_path>
-# 例：     rtsp://192.168.1.100:8554/camC
-rtsp_push:
-  enable: true                        # 可選：true / false
-  port: 8554                          # RTSP server 監聽 port
-  mount_path: "camC"                  # URL 路徑名稱（rtsp://IP:port/{mount_path}）
-  bitrate: 4000000                    # bps，1080p 建議 4M~8M
-  encoder: "h264"                     # 可選：h264（相容性高，推薦） / h265（檔案小，部分播放器不支援）
 
 # ------------------------------------------------------------
 # 追蹤器 ⭐  
