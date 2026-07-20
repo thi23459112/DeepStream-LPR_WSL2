@@ -86,13 +86,14 @@ g_stall_notify  = {}   # pad_index -> 具名卡幀通知累計次數（恢復吐
 g_restart_counts = {}  # pad_index -> 看門狗連續重啟/重建次數（恢復吐幀即歸零）
 g_last_restart = {}    # pad_index -> 上次重啟時間戳（防連環重啟）
 WATCHDOG_STALL_SEC = 60    # 連續幾秒沒吐幀 → 判定卡死
-WATCHDOG_GRACE_SEC = 60    # 重啟後寬限幾秒（期間不再判定）
+WATCHDOG_GRACE_SEC = 60    # 重建後寬限幾秒（期間不再判定）——適用「重建後有進過幀」（恢復中，給足觀察時間）
+WATCHDOG_GRACE_FAST = 30   # 快速重試寬限——適用「重建後連一幀都沒進來」（對端沒回應，縮短失敗循環）。
+                           # 不可低於「首幀所需時間」（握手+等關鍵幀+解碼器初始化，約 3~15s），
+                           # 否則會親手殺掉每一次快成功的連線，變成自己造成的無限循環
 WATCHDOG_CHECK_SEC = 10    # 每幾秒檢查一次
 WATCHDOG_NOTIFY_SEC = 15   # 卡幀超過此秒數即開始「具名」回報（早於重啟門檻，方便定位是哪一路）
 WATCHDOG_MIN_FPS = 1.0     # 滴幀偵測門檻：觀察窗內平均 FPS 低於此值視同卡死。堵住「內建重連
                            # 半成功、每次滴進幾幀把 idle 重置，導致看門狗永遠不觸發」的漏洞
-WATCHDOG_REBUILD_AFTER = 3 # 同一路連續整顆重啟 N 次仍未恢復 → 升級為「移除元件、全新重建」
-                           # （全新 RTSP session，等效手動關掉播放器重開，可跳出半成功迴圈）
 
 
 def force_quit_loop():
@@ -321,35 +322,28 @@ def _restart_one_source(pad_index):
     src, cam = info["src"], info["cam"]
     g_restart_counts[pad_index] = g_restart_counts.get(pad_index, 0) + 1
     n = g_restart_counts[pad_index]
-    rebuild = n > WATCHDOG_REBUILD_AFTER   # 前 N 次：整顆重啟；之後每次：移除元件全新重建
-    print(f"[WATCHDOG] {'重建' if rebuild else '重啟'} {cam}（pad={pad_index}）— 連續第 {n} 次"
-          + (f"（前 {WATCHDOG_REBUILD_AFTER} 次重啟未恢復 → 升級為移除元件、建立全新 RTSP session）" if rebuild and n == WATCHDOG_REBUILD_AFTER + 1 else ""))
+    print(f"[WATCHDOG] 重建 {cam}（pad={pad_index}） — 連續第 {n} 次（移除舊元件、建立全新 RTSP session）")
     try:
         # 該路 source 設 NULL，等狀態確實切換（tee 與下游掛在 pipeline 上，不受影響）
         src.set_state(Gst.State.NULL)
         src.get_state(Gst.CLOCK_TIME_NONE)
 
-        if rebuild:
-            # 升級路徑：把舊元件整顆移出 pipeline，建立「全新」nvurisrcbin。
-            # 全新元件 = 全新 rtspsrc / 全新 TCP 連線 / 內部狀態歸零，
-            # 等效手動關掉播放器重開，可跳出「半成功重連迴圈」等內部卡死狀態。
-            # 新元件吐 pad → cb_newpad 偵測到既有 tee，直接接回 decoder → tee.sink。
-            g_pipeline.remove(src)
-            info["rebuilds"] = info.get("rebuilds", 0) + 1
-            new_name = f"uri-decode-bin-{pad_index}-r{info['rebuilds']}"
-            new_src = _create_source_element(pad_index, info["cfg"], info["streammux"], new_name)
-            g_pipeline.add(new_src)
-            new_src.sync_state_with_parent()
-            info["src"] = new_src
-            g_last_restart[pad_index] = time.time()
-            print(f"[WATCHDOG] {cam} 已重建為全新元件（{new_name}），等待重新連線...")
-        else:
-            # 一般路徑：重新 PLAYING → nvurisrcbin 重連、重新吐 pad → cb_newpad 接回既有 tee
-            src.set_state(Gst.State.PLAYING)
-            g_last_restart[pad_index] = time.time()
-            print(f"[WATCHDOG] {cam} 已送出重啟，等待重新連線...")
+        # 把舊元件整顆移出 pipeline，建立「全新」nvurisrcbin。
+        # 全新元件 = 全新 rtspsrc / 全新 TCP 連線 / 無殘留 ghost pad / 內部狀態歸零，
+        # 等效手動關掉播放器重開。實測證明：同一顆元件 NULL→PLAYING 的「重啟」會撞
+        # 自己殘留的 vsrc_0 ghost pad（pad 不隨狀態切換移除）而接不回來，故一律重建。
+        # 新元件吐 pad → cb_newpad 偵測到既有 tee，直接接回 decoder → tee.sink。
+        g_pipeline.remove(src)
+        info["rebuilds"] = info.get("rebuilds", 0) + 1
+        new_name = f"uri-decode-bin-{pad_index}-r{info['rebuilds']}"
+        new_src = _create_source_element(pad_index, info["cfg"], info["streammux"], new_name)
+        g_pipeline.add(new_src)
+        new_src.sync_state_with_parent()
+        info["src"] = new_src
+        g_last_restart[pad_index] = time.time()
+        print(f"[WATCHDOG] {cam} 已重建為全新元件（{new_name}），等待重新連線...")
     except Exception as e:
-        print(f"[WATCHDOG] {'重建' if rebuild else '重啟'} {cam} 發生例外: {e}")
+        print(f"[WATCHDOG] 重建 {cam} 發生例外: {e}")
     return False   # 給 idle_add 用，只跑一次
 
 
@@ -366,11 +360,14 @@ def _watchdog_check():
         return False
     now = time.time()
     for pad_index, info in list(g_sources.items()):
-        # 重啟寬限期內不判定
-        if now - g_last_restart.get(pad_index, 0) < WATCHDOG_GRACE_SEC:
-            continue
+        # 重建寬限（自適應）：重建後「有進過幀」= 恢復中 → 給滿 GRACE_SEC 觀察；
+        # 「連一幀都沒進來」= 對端沒回應 → 只等 GRACE_FAST 就再重建，縮短失敗循環
+        last_rs = g_last_restart.get(pad_index, 0)
         stats = fps_streams.get(pad_index, {})
         ts = stats.get("timestamps")
+        grace = WATCHDOG_GRACE_SEC if (ts and ts[-1] > last_rs) else WATCHDOG_GRACE_FAST
+        if now - last_rs < grace:
+            continue
         if not ts:
             continue   # 還沒收過任何幀（剛啟動/首連中），交給 nvurisrcbin 內建重連
         idle = now - ts[-1]
@@ -393,14 +390,14 @@ def _watchdog_check():
         elif g_stall_notify.get(pad_index, 0) > 0:
             # 從卡幀狀態恢復 → 回報並歸零計數
             print(f"[{cam}] ✅ 已恢復吐幀（先前通知 {g_stall_notify[pad_index]} 次、"
-                  f"看門狗重啟/重建 {g_restart_counts.get(pad_index, 0)} 次）")
+                  f"看門狗重建 {g_restart_counts.get(pad_index, 0)} 次）")
             g_stall_notify[pad_index] = 0
             g_restart_counts[pad_index] = 0
             info["rebuilds"] = 0
 
         if stalled:
             reason = f"已 {idle:.0f} 秒無新幀" if idle >= WATCHDOG_STALL_SEC else f"滴幀（近 {span:.0f}s 平均 {rate:.2f} FPS）"
-            print(f"[WATCHDOG] {cam}（pad={pad_index}）{reason}，判定卡死 → 單路處置")
+            print(f"[WATCHDOG] {cam}（pad={pad_index}）{reason}，判定卡死 → 移除重建")
             GLib.idle_add(_restart_one_source, pad_index)
     return True   # 回 True 讓 timer 持續
 
@@ -570,7 +567,7 @@ def main():
         if g_sources:
             GLib.timeout_add_seconds(WATCHDOG_CHECK_SEC, _watchdog_check)
             print(f"[INFO] 看門狗啟動：監控 {len(g_sources)} 路即時串流，"
-                  f"每 {WATCHDOG_CHECK_SEC}s 檢查，卡死門檻 {WATCHDOG_STALL_SEC}s，重啟寬限 {WATCHDOG_GRACE_SEC}s")
+                  f"每 {WATCHDOG_CHECK_SEC}s 檢查，卡死門檻 {WATCHDOG_STALL_SEC}s，寬限 有幀{WATCHDOG_GRACE_SEC}s/無幀{WATCHDOG_GRACE_FAST}s")
 
         g_loop.run()
     finally:
